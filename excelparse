@@ -1,0 +1,101 @@
+"""
+Reads column A of an Excel workbook, looks for rows like "Check Google is up",
+hits the corresponding URL, and writes "Reachable" / "Not Reachable (...)" into
+column B (the cell next to it).
+
+Install dependencies first:
+    pip install openpyxl requests
+"""
+
+import re
+import sys
+
+import requests
+from openpyxl import load_workbook
+
+# Matches phrases like "Check Google is UP" or "Check Linked in is up"
+# and pulls out the site name in the middle.
+CHECK_PATTERN = re.compile(r"Check\s+(.+?)\s+is\s+up", re.IGNORECASE)
+
+# Add your internal/company URLs here. The key must match the text between
+# "Check" and "is up" in column A exactly (matching is case-insensitive).
+URL_OVERRIDES = {
+    "mycompany portal": "https://portal.mycompany.internal",
+    # "another internal site": "https://intranet.mycompany.com:8080",
+}
+
+# Some sites (LinkedIn included) reject requests with no User-Agent.
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
+}
+
+TIMEOUT_SECONDS = 10
+
+
+def build_url_from_label(label: str) -> str | None:
+    match = CHECK_PATTERN.search(label)
+    if not match:
+        return None
+
+    raw_name = match.group(1).strip()
+
+    override = URL_OVERRIDES.get(raw_name.lower())
+    if override:
+        return override
+
+    name = raw_name.replace(" ", "").lower()
+    if not name:
+        return None
+
+    return f"https://www.{name}.com"
+
+
+def check_url(url: str) -> tuple[bool, str]:
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=TIMEOUT_SECONDS, allow_redirects=True)
+        return response.status_code == 200, str(response.status_code)
+    except requests.exceptions.Timeout:
+        return False, "Timeout"
+    except requests.exceptions.RequestException as ex:
+        return False, str(ex)
+
+
+def main() -> None:
+    file_path = sys.argv[1] if len(sys.argv) > 1 else r"C:\Users\Gagan\OneDrive\Documents\Scripting\excel-parse-test.xlsx"
+
+    workbook = load_workbook(file_path)
+    worksheet = workbook.active
+
+    if worksheet.max_row is None:
+        print("No data found in worksheet.")
+        return
+
+    for row in range(1, worksheet.max_row + 1):
+        label_cell = worksheet.cell(row=row, column=1)
+        label = (label_cell.value or "").strip() if isinstance(label_cell.value, str) else ""
+
+        if not label:
+            continue
+
+        url = build_url_from_label(label)
+        result_cell = worksheet.cell(row=row, column=2)
+
+        if url is None:
+            result_cell.value = "Unrecognized check"
+            print(f'Row {row}: could not parse a target from "{label}"')
+            continue
+
+        is_reachable, status = check_url(url)
+        result_cell.value = "Reachable" if is_reachable else f"Not Reachable ({status})"
+
+        print(f"Row {row}: {label} -> {url} -> {result_cell.value}")
+
+    workbook.save(file_path)
+    print("Done. Results written and file saved.")
+
+
+if __name__ == "__main__":
+    main()
