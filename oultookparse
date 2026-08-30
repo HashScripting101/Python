@@ -1,0 +1,85 @@
+"""
+Reads the email currently open (in its own window) or selected in Outlook
+desktop, finds a 2x2 HTML table in the body, and checks each cell for
+"good" / "not good".
+
+Works via COM automation against Outlook already running on your machine -
+no Azure AD / cloud app registration needed. Requires classic Outlook
+desktop (not the new "Outlook for Windows" app, which doesn't expose this).
+
+Install dependencies:
+    pip install pywin32 beautifulsoup4
+"""
+
+import re
+
+import win32com.client
+from bs4 import BeautifulSoup
+
+# Matches "not good" (checked first) vs a standalone "good", so "not good"
+# doesn't get misread as a match for "good".
+NOT_GOOD_PATTERN = re.compile(r"\bnot\s+good\b", re.IGNORECASE)
+GOOD_PATTERN = re.compile(r"\bgood\b", re.IGNORECASE)
+
+
+def get_current_email():
+    outlook = win32com.client.Dispatch("Outlook.Application")
+
+    # If an email is open in its own window, use that.
+    inspector = outlook.ActiveInspector()
+    if inspector is not None and inspector.CurrentItem is not None:
+        return inspector.CurrentItem
+
+    # Otherwise fall back to whatever's selected in the main Outlook window.
+    explorer = outlook.ActiveExplorer()
+    if explorer is not None and explorer.Selection.Count > 0:
+        return explorer.Selection.Item(1)
+
+    raise RuntimeError("No email is open or selected in Outlook.")
+
+
+def classify_cell(text: str) -> str:
+    text = text.strip()
+    if NOT_GOOD_PATTERN.search(text):
+        return "Not Good"
+    if GOOD_PATTERN.search(text):
+        return "Good"
+    return f'Unrecognized ("{text}")' if text else "Empty"
+
+
+def check_table(html_body: str) -> None:
+    soup = BeautifulSoup(html_body, "html.parser")
+    tables = soup.find_all("table")
+
+    if not tables:
+        print("No table found in the email body.")
+        return
+
+    # If the email has more than one table, this grabs the first one -
+    # adjust the index below if that's not the one you want.
+    table = tables[0]
+    rows = table.find_all("tr")
+
+    print(f"Found a table with {len(rows)} row(s).")
+    for row_index, row in enumerate(rows, start=1):
+        cells = row.find_all(["td", "th"])
+        for col_index, cell in enumerate(cells, start=1):
+            text = cell.get_text(separator=" ", strip=True)
+            result = classify_cell(text)
+            print(f'  Row {row_index}, Col {col_index}: "{text}" -> {result}')
+
+
+def main() -> None:
+    email = get_current_email()
+    print(f'Checking email: "{email.Subject}"')
+
+    html_body = email.HTMLBody
+    if not html_body:
+        print("This email doesn't have an HTML body - can't parse a table out of it.")
+        return
+
+    check_table(html_body)
+
+
+if __name__ == "__main__":
+    main()
