@@ -1,0 +1,213 @@
+"""
+Outlook keyword scanner.
+
+Usage (Windows, desktop Outlook installed):
+    pip install pywin32 python-docx
+    python outlook_keyword_scan.py --keywords "audit trail,epic,metadata" --days 60 --subfolders --csv hits.csv --save-dir matched_docs
+
+Searches subject + body of each mail item, then any .docx/.docm/.doc attachments.
+Matching is case-insensitive and whole-word.
+"""
+
+import argparse
+import csv
+import os
+import re
+import shutil
+import sys
+import tempfile
+import uuid
+from datetime import datetime, timedelta
+
+import win32com.client
+from docx import Document
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Scan Outlook mail and Word attachments for keywords.")
+    p.add_argument("--keywords", required=True, help='Comma-separated, e.g. "invoice,contract,deposition"')
+    p.add_argument("--folder", default="Inbox", help="Folder name to scan (default: Inbox)")
+    p.add_argument("--days", type=int, default=30, help="Only scan mail received in the last N days (0 = all)")
+    p.add_argument("--subfolders", action="store_true", help="Recurse into subfolders")
+    p.add_argument("--csv", help="Write results to this CSV file")
+    p.add_argument("--save-dir", help="Copy matching Word attachments into this folder")
+    return p.parse_args()
+
+
+# ---------- Word readers ----------
+def read_docx(path):
+    doc = Document(path)
+    parts = [p.text for p in doc.paragraphs]
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                parts.append(cell.text)
+    for section in doc.sections:
+        parts.extend(p.text for p in section.header.paragraphs)
+        parts.extend(p.text for p in section.footer.paragraphs)
+    return "\n".join(parts)
+
+
+def read_legacy_doc(path):
+    """Binary .doc has no OpenXML; fall back to Word automation."""
+    word = win32com.client.Dispatch("Word.Application")
+    word.Visible = False
+    doc = None
+    try:
+        doc = word.Documents.Open(path, ReadOnly=True, Visible=False)
+        return doc.Content.Text
+    finally:
+        if doc is not None:
+            doc.Close(False)
+        word.Quit()
+
+
+# ---------- Outlook helpers ----------
+def find_folder(parent, name):
+    for f in parent.Folders:
+        if f.Name.lower() == name.lower():
+            return f
+        deeper = find_folder(f, name)
+        if deeper is not None:
+            return deeper
+    return None
+
+
+class Scanner:
+    def __init__(self, keywords, temp_dir, save_dir=None):
+        self.save_dir = save_dir
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        pattern = r"\b(" + "|".join(re.escape(k) for k in keywords) + r")\b"
+        self.regex = re.compile(pattern, re.IGNORECASE)
+        self.temp_dir = temp_dir
+        self.hits = []
+
+    def check_text(self, text, location, subject, sender, received, document=None):
+        matches = list(self.regex.finditer(text or ""))
+        if not matches:
+            return False
+        first = matches[0]
+        start = max(0, first.start() - 60)
+        end = min(len(text), first.end() + 60)
+        snippet = re.sub(r"\s+", " ", text[start:end]).strip()
+        matched = sorted({m.group(0).lower() for m in matches})
+        self.hits.append({
+            "received": received, "sender": sender, "subject": subject,
+            "location": location, "document": document or "",
+            "keywords": matched, "snippet": snippet,
+        })
+        return True
+
+    def scan_mail(self, mail):
+        subject = mail.Subject or ""
+        sender = mail.SenderEmailAddress or mail.SenderName or ""
+        received = mail.ReceivedTime  # pywintypes datetime
+        received = datetime(received.year, received.month, received.day,
+                            received.hour, received.minute, received.second)
+
+        self.check_text(subject + "\n" + (mail.Body or ""), "Email body", subject, sender, received)
+
+        for att in mail.Attachments:
+            name = att.FileName or ""
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in (".docx", ".docm", ".doc"):
+                continue
+            path = os.path.join(self.temp_dir, f"{uuid.uuid4()}{ext}")
+            att.SaveAsFile(path)
+            try:
+                text = read_legacy_doc(path) if ext == ".doc" else read_docx(path)
+                found = self.check_text(text, "Word attachment", subject, sender, received, document=name)
+                if found and self.save_dir:
+                    stamp = received.strftime("%Y%m%d_%H%M")
+                    dest = os.path.join(self.save_dir, f"{stamp}_{name}")
+                    shutil.copy2(path, dest)
+                    self.hits[-1]["saved_to"] = dest
+            except Exception as ex:
+                print(f"  ! Could not read attachment '{name}': {ex}", file=sys.stderr)
+            finally:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    def scan_folder(self, folder, days, recurse):
+        items = folder.Items
+        items.Sort("[ReceivedTime]", True)
+        if days > 0:
+            since = (datetime.now() - timedelta(days=days)).strftime("%m/%d/%Y %H:%M")
+            items = items.Restrict(f"[ReceivedTime] >= '{since}'")
+
+        for item in items:
+            # 43 = olMail; skip meeting requests, reports, etc.
+            if getattr(item, "Class", None) != 43:
+                continue
+            try:
+                self.scan_mail(item)
+            except Exception as ex:
+                print(f"  ! Skipped '{getattr(item, 'Subject', '?')}': {ex}", file=sys.stderr)
+
+        if recurse:
+            for sub in folder.Folders:
+                self.scan_folder(sub, days, True)
+
+
+def main():
+    args = parse_args()
+    keywords = [k.strip() for k in args.keywords.split(",") if k.strip()]
+    if not keywords:
+        print("No keywords given.", file=sys.stderr)
+        return 1
+
+    temp_dir = os.path.join(tempfile.gettempdir(), "OutlookKeywordScan")
+    os.makedirs(temp_dir, exist_ok=True)
+
+    try:
+        app = win32com.client.Dispatch("Outlook.Application")
+        ns = app.GetNamespace("MAPI")
+    except Exception as ex:
+        print(f"Could not connect to Outlook: {ex}", file=sys.stderr)
+        return 2
+
+    if args.folder.lower() == "inbox":
+        root = ns.GetDefaultFolder(6)  # olFolderInbox
+    else:
+        root = None
+        for store in ns.Folders:
+            root = find_folder(store, args.folder)
+            if root is not None:
+                break
+        if root is None:
+            print(f"Folder '{args.folder}' not found.", file=sys.stderr)
+            return 3
+
+    print(f"Scanning '{root.FolderPath}' for: {', '.join(keywords)}")
+    scanner = Scanner(keywords, temp_dir, args.save_dir)
+    scanner.scan_folder(root, args.days, args.subfolders)
+
+    print(f"\n{len(scanner.hits)} hit(s).")
+    for h in scanner.hits:
+        print(f"[{h['received']:%Y-%m-%d %H:%M}] {h['sender']} | {h['subject']}")
+        if h["document"]:
+            print(f"    Document: {h['document']}")
+            if h.get("saved_to"):
+                print(f"    Saved to: {h['saved_to']}")
+        else:
+            print(f"    Found in: {h['location']}")
+        print(f"    Keywords: {', '.join(h['keywords'])}")
+        print(f"    ...{h['snippet']}...")
+
+    if args.csv:
+        with open(args.csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["Received", "Sender", "Subject", "Location", "Document", "SavedTo", "Keywords", "Snippet"])
+            for h in scanner.hits:
+                w.writerow([h["received"].isoformat(), h["sender"], h["subject"],
+                            h["location"], h["document"], h.get("saved_to", ""),
+                            ";".join(h["keywords"]), h["snippet"]])
+        print(f"Wrote {args.csv}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
