@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""
+docsum.py - Offline document summarizer & analyzer for .docx and .pdf
+
+No AI / no LLM / no network. Uses classical extractive summarization
+(word-frequency + Luhn-style sentence scoring). Everything runs locally.
+
+Dependencies (install from your approved internal package mirror):
+    python-docx   -> .docx parsing
+    pypdf         -> .pdf text + metadata
+
+Usage:
+    python docsum.py "C:\\path\\to\\file.docx"
+    python docsum.py report.pdf --sentences 7
+    python docsum.py file.pdf --full-text > extracted.txt
+"""
+
+import argparse
+import os
+import re
+import sys
+from collections import Counter
+
+# ----- extraction ---------------------------------------------------------
+
+def extract_docx(path):
+    """Return (text, details_dict) for a Word document."""
+    from docx import Document
+    doc = Document(path)
+
+    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+    headings = [p.text.strip() for p in doc.paragraphs
+                if p.style and p.style.name and p.style.name.startswith("Heading")
+                and p.text.strip()]
+    text = "\n".join(paragraphs)
+
+    # pull any text sitting inside tables too
+    table_text = []
+    for tbl in doc.tables:
+        for row in tbl.rows:
+            for cell in row.cells:
+                if cell.text.strip():
+                    table_text.append(cell.text.strip())
+    if table_text:
+        text += "\n" + "\n".join(table_text)
+
+    cp = doc.core_properties
+    details = {
+        "type": "Word document (.docx)",
+        "title": cp.title or "",
+        "author": cp.author or "",
+        "last_modified_by": cp.last_modified_by or "",
+        "created": str(cp.created) if cp.created else "",
+        "modified": str(cp.modified) if cp.modified else "",
+        "revision": cp.revision or "",
+        "category": cp.category or "",
+        "paragraphs": len(paragraphs),
+        "tables": len(doc.tables),
+        "headings": headings,
+    }
+    return text, details
+
+
+def extract_pdf(path):
+    """Return (text, details_dict) for a PDF."""
+    from pypdf import PdfReader
+    reader = PdfReader(path)
+
+    pages_text = []
+    for page in reader.pages:
+        try:
+            pages_text.append(page.extract_text() or "")
+        except Exception:
+            pages_text.append("")
+    text = "\n".join(pages_text)
+
+    meta = reader.metadata or {}
+    def g(key):
+        try:
+            return str(meta.get(key) or "")
+        except Exception:
+            return ""
+
+    details = {
+        "type": "PDF (.pdf)",
+        "title": g("/Title"),
+        "author": g("/Author"),
+        "creator": g("/Creator"),
+        "producer": g("/Producer"),
+        "created": g("/CreationDate"),
+        "modified": g("/ModDate"),
+        "pages": len(reader.pages),
+        "encrypted": reader.is_encrypted,
+        # Heuristic: lots of pages but almost no text usually means a scan.
+        "likely_scanned": (len(reader.pages) > 0
+                           and len(text.strip()) < 40 * len(reader.pages)),
+    }
+    return text, details
+
+
+# ----- summarization (pure Python, no external NLP model) -----------------
+
+# Small built-in stopword list so we don't need nltk/spacy.
+STOPWORDS = set("""
+a about above after again against all am an and any are aren't as at be because
+been before being below between both but by can cannot could couldn't did didn't
+do does doesn't doing don't down during each few for from further had hadn't has
+hasn't have haven't having he he'd he'll he's her here here's hers herself him
+himself his how how's i i'd i'll i'm i've if in into is isn't it it's its itself
+let's me more most mustn't my myself no nor not of off on once only or other ought
+our ours ourselves out over own same shan't she she'd she'll she's should
+shouldn't so some such than that that's the their theirs them themselves then
+there there's these they they'd they'll they're they've this those through to too
+under until up very was wasn't we we'd we'll we're we've were weren't what what's
+when when's where where's which while who who's whom why why's with won't would
+wouldn't you you'd you'll you're you've your yours yourself yourselves
+""".split())
+
+
+def split_sentences(text):
+    out = []
+    for line in text.splitlines():          # keep paragraph/heading boundaries
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line:
+            continue
+        # Split on ., !, ? followed by space + capital/quote. Rough but dependency-free.
+        parts = re.split(r"(?<=[.!?])\s+(?=[\"'(A-Z0-9])", line)
+        out.extend(p.strip() for p in parts if len(p.strip()) > 25)
+    return out
+
+
+def summarize(text, max_sentences=5):
+    sentences = split_sentences(text)
+    if len(sentences) <= max_sentences:
+        return sentences
+
+    # Word frequencies (content words only), normalized to the most common.
+    words = re.findall(r"[A-Za-z][A-Za-z'-]+", text.lower())
+    freq = Counter(w for w in words if w not in STOPWORDS and len(w) > 2)
+    if not freq:
+        return sentences[:max_sentences]
+    top = freq.most_common(1)[0][1]
+    for w in freq:
+        freq[w] /= top
+
+    scored = []
+    n = len(sentences)
+    for i, s in enumerate(sentences):
+        sw = re.findall(r"[A-Za-z][A-Za-z'-]+", s.lower())
+        if not sw:
+            continue
+        score = sum(freq.get(w, 0) for w in sw) / (len(sw) ** 0.5)  # length-normalized
+        score *= 1.15 if i < n * 0.15 else 1.0                       # small lead bonus
+        scored.append((score, i, s))
+
+    top_idx = sorted(s[1] for s in sorted(scored, reverse=True)[:max_sentences])
+    return [sentences[i] for i in top_idx]
+
+
+# ----- reporting ----------------------------------------------------------
+
+def word_count(text):
+    return len(re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]*", text))
+
+
+def print_report(path, text, details, max_sentences):
+    wc = word_count(text)
+    size_kb = os.path.getsize(path) / 1024
+
+    print("=" * 70)
+    print(f"FILE:  {os.path.basename(path)}  ({size_kb:.0f} KB)")
+    print("=" * 70)
+
+    print("\n--- DETAILS ---")
+    for k, v in details.items():
+        if k == "headings":
+            continue
+        if v not in ("", None):
+            print(f"  {k:>16}: {v}")
+    print(f"  {'word_count':>16}: {wc:,}")
+    print(f"  {'read_time_min':>16}: {max(1, round(wc / 200))}")
+
+    if details.get("headings"):
+        print("\n--- OUTLINE ---")
+        for h in details["headings"][:40]:
+            print(f"  • {h}")
+
+    if details.get("likely_scanned"):
+        print("\n  [!] Little/no extractable text - this PDF looks scanned.")
+        print("      Run OCR first (e.g. Tesseract via ocrmypdf) if approved.")
+
+    print(f"\n--- SUMMARY (top {max_sentences} sentences) ---")
+    summary = summarize(text, max_sentences)
+    if summary:
+        for s in summary:
+            print(f"  • {s}")
+    else:
+        print("  (no summarizable text found)")
+    print()
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Offline .docx / .pdf summarizer & analyzer")
+    ap.add_argument("path", help="path to a .docx or .pdf file")
+    ap.add_argument("--sentences", type=int, default=5, help="summary length (default 5)")
+    ap.add_argument("--full-text", action="store_true", help="dump extracted text and exit")
+    args = ap.parse_args()
+
+    if not os.path.isfile(args.path):
+        sys.exit(f"Not a file: {args.path}")
+
+    ext = os.path.splitext(args.path)[1].lower()
+    if ext == ".docx":
+        text, details = extract_docx(args.path)
+    elif ext == ".pdf":
+        text, details = extract_pdf(args.path)
+    else:
+        sys.exit(f"Unsupported type '{ext}'. Use .docx or .pdf")
+
+    if args.full_text:
+        print(text)
+        return
+
+    print_report(args.path, text, details, args.sentences)
+
+
+if __name__ == "__main__":
+    main()
