@@ -1,0 +1,220 @@
+================================================================================
+OUTLOOK FILE SEARCH - QUICK START
+================================================================================
+
+CHOOSE YOUR SETUP:
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ OPTION A: Simple Outlook Search (RECOMMENDED - Windows users)           │
+│                                                                         │
+│ Requirements: Windows, Outlook running, Python 3.7+                    │
+│ Script: outlook_search_simple.py                                       │
+│                                                                         │
+│ Install & Run (Copy/Paste):                                            │
+│   pip install pywin32 python-docx openpyxl pandas                      │
+│   python Scripts/pywin32_postinstall.py -install                       │
+│   python outlook_search_simple.py                                      │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ OPTION B: Folder Search (EASIEST - Any OS)                              │
+│                                                                         │
+│ Requirements: Folder with documents, Python 3.7+                       │
+│ Script: outlook_search_pst.py (choose option 2)                        │
+│                                                                         │
+│ Install & Run (Copy/Paste):                                            │
+│   pip install python-docx openpyxl pandas                              │
+│   python outlook_search_pst.py                                         │
+│   # Choose option 2, enter folder path                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+ALL DEPENDENCIES EXPLAINED
+================================================================================
+
+MUST HAVE:
+  None! Python 3.7+ is all you need to start.
+
+RECOMMENDED (for reading attachments):
+  - python-docx   → Read .docx (Word) files
+  - openpyxl      → Read .xlsx (Excel) files  
+  - pandas        → Read .csv files (better Excel too)
+  - pywin32       → Access Outlook directly (Windows only)
+
+INSTALL ALL:
+  pip install pywin32 python-docx openpyxl pandas
+
+INSTALL MINIMAL (csv/text only):
+  pip install pandas
+
+================================================================================
+SCRIPT DOCUMENTATION
+================================================================================
+
+Each script has DETAILED COMMENTS explaining:
+  - What each function does
+  - Required dependencies
+  - Error handling
+  - How to modify for your needs
+
+COMMENTS ARE IN THE CODE - Just open the .py file and read!
+
+================================================================================
+STEP-BY-STEP: OPTION A (Simple Outlook Search)
+================================================================================
+
+1. INSTALL DEPENDENCIES
+   Open command prompt/terminal and run:
+   
+   pip install pywin32 python-docx openpyxl pandas
+
+2. POST-INSTALL PYWIN32 (Windows Only)
+   Run in Windows Admin Command Prompt:
+   
+   python Scripts/pywin32_postinstall.py -install
+
+3. OPEN OUTLOOK
+   Make sure Outlook desktop app is running and logged in
+
+4. RUN THE SCRIPT
+   python outlook_search_simple.py
+
+5. FOLLOW PROMPTS
+   - Enter email filter (optional)
+   - View found attachments
+   - Enter search keywords
+   - Review results
+
+================================================================================
+STEP-BY-STEP: OPTION B (Folder Search)
+================================================================================
+
+1. INSTALL DEPENDENCIES
+   pip install python-docx openpyxl pandas
+
+2. RUN THE SCRIPT
+   python outlook_search_pst.py
+
+3. CHOOSE OPTION 2
+   Enter: 2
+
+4. ENTER FOLDER PATH
+   Example: C:\Users\john\Downloads\EmailAttachments
+   
+5. FOLLOW PROMPTS
+   - View files found
+   - Enter search keywords
+   - Review results
+
+================================================================================
+WHAT YOU'LL SEE
+================================================================================
+
+OUTLOOK FILE ATTACHMENT SEARCHER
+================================================================================
+
+Filter emails by subject keyword (or press Enter for all): budget
+
+🔗 Connecting to Outlook...
+✅ Connected to Outlook successfully
+
+📧 Searching Outlook for attachments...
+✅ Scanned 150 emails
+✅ Found 23 supported files
+
+================================================================================
+FOUND 23 ATTACHMENT FILES
+================================================================================
+
+.XLSX FILES (8 found):
+--------
+  [1] Q3_Budget_2024.xlsx
+      From: finance@example.com
+      Subject: Q3 2024 Budget Planning
+
+🔎 What would you like to search for? (or 'quit' to exit): revenue
+
+🔍 Searching for 'revenue' in 23 files...
+
+================================================================================
+SEARCH RESULTS FOR: 'revenue'
+================================================================================
+Files searched: 23
+Matches found: 3
+
+[1] Q3_Budget_2024.xlsx
+    From: finance@example.com
+    Subject: Q3 Budget Planning
+    Matched lines (6 found):
+      • Revenue projections: Q1=$850K, Q2=$920K, Q3=$1M
+      • Revenue growth: 8% YoY
+      • Revenue risks: Market downturn
+
+================================================================================
+COMMON PROBLEMS & FIXES
+================================================================================
+
+PROBLEM: "ModuleNotFoundError: No module named 'win32com'"
+FIX:     pip install pywin32
+         python Scripts/pywin32_postinstall.py -install
+
+PROBLEM: "Outlook application not found"
+FIX:     Open Outlook desktop app first, make sure you're logged in
+
+PROBLEM: "No files found"
+FIX:     Check your emails actually have attachments
+         Try without email filter (leave blank)
+
+PROBLEM: "PermissionError"
+FIX:     Run Python as Administrator
+         Close Outlook if using PST file
+
+PROBLEM: Script is slow
+FIX:     Normal for first run with 1000+ emails
+         Use email filter keyword to narrow search
+
+PROBLEM: "WARNING: python-docx not installed"
+FIX:     Install it: pip install python-docx
+         It's optional but recommended
+
+================================================================================
+SUPPORTED FILE TYPES
+================================================================================
+
+SUPPORTED:
+  .txt   → Plain text files
+  .csv   → Comma-separated values (requires pandas for best results)
+  .xlsx  → Excel files (requires openpyxl)
+  .xls   → Older Excel files (requires openpyxl)
+  .docx  → Word documents (requires python-docx)
+
+NOT SUPPORTED:
+  .pdf, .jpg, .png, .zip, etc.
+
+Missing a library? Script will skip that file type and warn you.
+
+================================================================================
+NEXT STEPS
+================================================================================
+
+1. Choose OPTION A or B above
+2. Copy/paste the install command
+3. Copy/paste the run command
+4. Follow the prompts
+5. Enter your search keywords
+6. View results in console
+
+You're done! All results display in the terminal.
+
+================================================================================
+NEED HELP?
+================================================================================
+
+READ THE COMMENTS IN THE SCRIPT:
+- outlook_search_simple.py - Has full documentation for Option A
+- outlook_search_pst.py    - Has full documentation for Options B/C
+- INSTALL_GUIDE.md         - Detailed troubleshooting
+
+EACH SCRIPT IS HEAVILY COMMENTED!
+
+================================================================================
