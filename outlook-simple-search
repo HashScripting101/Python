@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+"""
+Outlook File Attachment Searcher - Local Version (No Azure AD Required)
+
+DEPENDENCIES:
+- pywin32: For Windows COM interface to Outlook
+  Install: pip install pywin32
+  Then run: python Scripts/pywin32_postinstall.py -install (as admin)
+  
+- python-docx: For reading DOCX files
+  Install: pip install python-docx
+  
+- openpyxl: For reading XLSX files
+  Install: pip install openpyxl
+  
+- pandas: For reading CSV and Excel files (optional but recommended)
+  Install: pip install pandas
+
+WINDOWS ONLY: This script uses COM to interact with Outlook directly.
+If you don't have Outlook installed locally, use outlook_search_pst.py instead.
+"""
+
+import os
+import sys
+import tempfile
+from pathlib import Path
+from typing import List, Dict, Optional
+
+# ============================================================================
+# DEPENDENCY IMPORTS - Add error handling for missing packages
+# ============================================================================
+
+try:
+    # For Windows COM interface to Outlook
+    import win32com.client
+    from win32com.client import Dispatch, constants
+except ImportError:
+    print("ERROR: pywin32 not installed")
+    print("Install with: pip install pywin32")
+    print("Then run: python Scripts/pywin32_postinstall.py -install")
+    sys.exit(1)
+
+try:
+    # For reading DOCX files
+    from docx import Document
+except ImportError:
+    print("WARNING: python-docx not installed. DOCX files will be skipped.")
+    print("Install with: pip install python-docx")
+    Document = None
+
+try:
+    # For reading Excel files
+    from openpyxl import load_workbook
+    import openpyxl
+except ImportError:
+    print("WARNING: openpyxl not installed. XLSX files will be skipped.")
+    print("Install with: pip install openpyxl")
+    openpyxl = None
+
+try:
+    # For reading CSV and Excel with pandas (optional, more robust)
+    import pandas as pd
+except ImportError:
+    print("INFO: pandas not installed (optional). CSV/Excel reading will be limited.")
+    print("Install for better support: pip install pandas")
+    pd = None
+
+
+# ============================================================================
+# MAIN CLASS
+# ============================================================================
+
+class OutlookLocalSearcher:
+    """Search Outlook attachments locally using COM interface."""
+    
+    # Supported file extensions
+    SUPPORTED_EXTENSIONS = {'.txt', '.docx', '.xlsx', '.xls', '.csv'}
+    
+    def __init__(self):
+        """Initialize Outlook connection."""
+        self.outlook = None
+        self.namespace = None
+        self.inbox = None
+        self.found_files: List[Dict] = []
+        self._connect_to_outlook()
+    
+    def _connect_to_outlook(self):
+        """Connect to Outlook using COM."""
+        try:
+            print("🔗 Connecting to Outlook...")
+            # Create Outlook application object via COM
+            self.outlook = win32com.client.GetActiveObject("Outlook.Application")
+            
+            # Get the namespace (MAPI session)
+            self.namespace = self.outlook.GetNamespace("MAPI")
+            
+            # Get the Inbox folder
+            self.inbox = self.namespace.GetDefaultFolder(6)  # 6 = olFolderInbox
+            
+            print("✅ Connected to Outlook successfully\n")
+            
+        except Exception as e:
+            print(f"❌ Error connecting to Outlook: {e}")
+            print("\nMake sure:")
+            print("1. Outlook is installed and running")
+            print("2. You are on Windows")
+            print("3. pywin32 is properly installed: pip install pywin32")
+            sys.exit(1)
+    
+    def search_attachments(self, subject_filter: Optional[str] = None) -> int:
+        """
+        Search through Outlook and find supported file attachments.
+        
+        Args:
+            subject_filter: Optional term to filter emails by subject
+            
+        Returns:
+            Number of files found
+        """
+        print("📧 Searching Outlook for attachments...")
+        
+        try:
+            # Get all items in inbox
+            items = self.inbox.Items
+            
+            # Filter by subject if provided
+            if subject_filter:
+                items = items.Restrict(f"[Subject] like '%{subject_filter}%'")
+            
+            email_count = 0
+            
+            # Iterate through emails
+            for item in items:
+                try:
+                    # Check if item has attachments
+                    if item.Attachments.Count > 0:
+                        email_count += 1
+                        self._process_email(item)
+                except Exception as e:
+                    # Skip emails that cause errors
+                    continue
+            
+            print(f"✅ Scanned {email_count} emails")
+            print(f"✅ Found {len(self.found_files)} supported files\n")
+            
+            return len(self.found_files)
+            
+        except Exception as e:
+            print(f"❌ Error searching attachments: {e}")
+            return 0
+    
+    def _process_email(self, email_item):
+        """Process a single email and extract supported attachments."""
+        try:
+            subject = email_item.Subject
+            sender = email_item.SenderName
+            
+            # Iterate through attachments
+            for attachment in email_item.Attachments:
+                filename = attachment.FileName
+                file_ext = Path(filename).suffix.lower()
+                
+                # Check if file type is supported
+                if file_ext in self.SUPPORTED_EXTENSIONS:
+                    self.found_files.append({
+                        'filename': filename,
+                        'extension': file_ext,
+                        'subject': subject,
+                        'sender': sender,
+                        'attachment_obj': attachment,
+                        'email_obj': email_item
+                    })
+                    
+        except Exception as e:
+            pass  # Skip problematic emails
+    
+    def search_content(self, search_query: str) -> Dict:
+        """
+        Search for content within the found files.
+        
+        Args:
+            search_query: Text to search for (case-insensitive)
+            
+        Returns:
+            Dictionary with search results
+        """
+        results = {
+            'query': search_query,
+            'matches': [],
+            'total_files_searched': len(self.found_files)
+        }
+        
+        if not self.found_files:
+            print("No files to search. Run search_attachments() first.")
+            return results
+        
+        print(f"🔍 Searching for '{search_query}' in {len(self.found_files)} files...\n")
+        
+        for file_info in self.found_files:
+            try:
+                content = self._download_and_read_file(file_info)
+                
+                if content and self._search_in_content(content, search_query):
+                    matched_lines = self._extract_matching_lines(content, search_query)
+                    
+                    results['matches'].append({
+                        'filename': file_info['filename'],
+                        'extension': file_info['extension'],
+                        'subject': file_info['subject'],
+                        'sender': file_info['sender'],
+                        'matched_lines': matched_lines,
+                        'match_count': len(matched_lines)
+                    })
+                    
+            except Exception as e:
+                # Skip files that error
+                continue
+        
+        return results
+    
+    def _download_and_read_file(self, file_info: Dict) -> Optional[str]:
+        """
+        Download attachment and read its content.
+        Saves to temp directory then reads.
+        
+        Args:
+            file_info: File information dictionary
+            
+        Returns:
+            File content as string or None if error
+        """
+        try:
+            attachment = file_info['attachment_obj']
+            filename = file_info['filename']
+            ext = file_info['extension']
+            
+            # Save to temp directory
+            temp_dir = tempfile.gettempdir()
+            temp_path = os.path.join(temp_dir, filename)
+            
+            # Download attachment
+            attachment.SaveAsFile(temp_path)
+            
+            # Read based on file type
+            if ext == '.txt':
+                return self._read_text_file(temp_path)
+            
+            elif ext == '.csv':
+                return self._read_csv_file(temp_path)
+            
+            elif ext in ['.xlsx', '.xls']:
+                return self._read_excel_file(temp_path)
+            
+            elif ext == '.docx':
+                return self._read_docx_file(temp_path)
+            
+            # Clean up temp file
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+                
+        except Exception as e:
+            return None
+        
+        return None
+    
+    @staticmethod
+    def _read_text_file(filepath: str) -> Optional[str]:
+        """Read plain text file."""
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+        except Exception as e:
+            return None
+    
+    @staticmethod
+    def _read_csv_file(filepath: str) -> Optional[str]:
+        """Read CSV file - tries pandas first, falls back to manual reading."""
+        try:
+            # Try pandas first (better handling)
+            if pd:
+                df = pd.read_csv(filepath)
+                return df.to_string()
+        except:
+            pass
+        
+        # Fallback: manual CSV reading
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+        except Exception as e:
+            return None
+    
+    @staticmethod
+    def _read_excel_file(filepath: str) -> Optional[str]:
+        """Read Excel file - tries pandas first, falls back to openpyxl."""
+        try:
+            # Try pandas first (better handling)
+            if pd:
+                excel_file = pd.ExcelFile(filepath)
+                content = []
+                for sheet in excel_file.sheet_names:
+                    df = pd.read_excel(filepath, sheet_name=sheet)
+                    content.append(f"\n--- Sheet: {sheet} ---\n")
+                    content.append(df.to_string())
+                return '\n'.join(content)
+        except:
+            pass
+        
+        # Fallback: openpyxl
+        try:
+            if openpyxl:
+                wb = load_workbook(filepath)
+                content = []
+                for sheet_name in wb.sheetnames:
+                    ws = wb[sheet_name]
+                    content.append(f"\n--- Sheet: {sheet_name} ---\n")
+                    for row in ws.iter_rows(values_only=True):
+                        content.append(str(row))
+                return '\n'.join(content)
+        except:
+            pass
+        
+        return None
+    
+    @staticmethod
+    def _read_docx_file(filepath: str) -> Optional[str]:
+        """Read DOCX file using python-docx."""
+        try:
+            if Document is None:
+                return None
+            
+            doc = Document(filepath)
+            content = []
+            
+            for para in doc.paragraphs:
+                if para.text.strip():
+                    content.append(para.text)
+            
+            return '\n'.join(content)
+            
+        except Exception as e:
+            return None
+    
+    @staticmethod
+    def _search_in_content(content: str, search_query: str) -> bool:
+        """Check if search query exists in content (case-insensitive)."""
+        return search_query.lower() in content.lower()
+    
+    @staticmethod
+    def _extract_matching_lines(content: str, search_query: str) -> List[str]:
+        """Extract lines containing the search query."""
+        lines = content.split('\n')
+        matching = []
+        
+        for line in lines:
+            if search_query.lower() in line.lower():
+                clean_line = line.strip()
+                if clean_line and len(clean_line) > 3:  # Avoid empty/tiny lines
+                    matching.append(clean_line)
+        
+        # Return first 10 matches
+        return matching[:10]
+    
+    def display_files_found(self):
+        """Display all found files to console."""
+        print("\n" + "="*80)
+        print(f"FOUND {len(self.found_files)} ATTACHMENT FILES")
+        print("="*80 + "\n")
+        
+        if not self.found_files:
+            print("No supported files found.")
+            return
+        
+        # Group by extension
+        by_type = {}
+        for file_info in self.found_files:
+            ext = file_info['extension']
+            if ext not in by_type:
+                by_type[ext] = []
+            by_type[ext].append(file_info)
+        
+        # Display by type
+        for ext in sorted(by_type.keys()):
+            print(f"\n{ext.upper()} FILES ({len(by_type[ext])} found):")
+            print("-" * 80)
+            
+            for i, file_info in enumerate(by_type[ext], 1):
+                print(f"  [{i}] {file_info['filename']}")
+                print(f"      From: {file_info['sender']}")
+                print(f"      Subject: {file_info['subject']}")
+    
+    def display_results(self, results: Dict):
+        """Display search results to console."""
+        print("\n" + "="*80)
+        print(f"SEARCH RESULTS FOR: '{results['query']}'")
+        print("="*80)
+        print(f"Files searched: {results['total_files_searched']}")
+        print(f"Matches found: {len(results['matches'])}\n")
+        
+        if not results['matches']:
+            print("❌ No matches found.")
+            return
+        
+        for i, match in enumerate(results['matches'], 1):
+            print(f"\n[{i}] {match['filename']}")
+            print(f"    From: {match['sender']}")
+            print(f"    Subject: {match['subject']}")
+            print(f"    Matched lines ({match['match_count']} found):")
+            
+            for line in match['matched_lines'][:5]:  # Show first 5
+                # Truncate long lines
+                if len(line) > 100:
+                    line = line[:97] + "..."
+                print(f"      • {line}")
+
+
+# ============================================================================
+# MAIN PROGRAM
+# ============================================================================
+
+def main():
+    """Main program flow."""
+    print("="*80)
+    print("OUTLOOK FILE ATTACHMENT SEARCHER")
+    print("Local Version (No Azure AD Required)")
+    print("="*80 + "\n")
+    
+    # Create searcher and connect to Outlook
+    searcher = OutlookLocalSearcher()
+    
+    # Get subject filter from user
+    email_filter = input("Filter emails by subject keyword (or press Enter for all): ").strip()
+    
+    # Search for attachments
+    file_count = searcher.search_attachments(email_filter if email_filter else None)
+    
+    if file_count == 0:
+        print("No files found. Exiting.")
+        return
+    
+    # Display found files
+    searcher.display_files_found()
+    
+    # Interactive search loop
+    print("\n" + "="*80)
+    print("SEARCH MODE")
+    print("="*80)
+    
+    while True:
+        print()
+        search_query = input("🔎 What would you like to search for? (or 'quit' to exit): ").strip()
+        
+        if search_query.lower() in ['quit', 'exit', 'q']:
+            print("\n✅ Goodbye!")
+            break
+        
+        if len(search_query) < 2:
+            print("❌ Please enter at least 2 characters")
+            continue
+        
+        # Search content
+        results = searcher.search_content(search_query)
+        searcher.display_results(results)
+
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n✅ Cancelled by user. Goodbye!")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n❌ Unexpected error: {e}")
+        sys.exit(1)
