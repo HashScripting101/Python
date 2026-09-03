@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""
+docsearch.py - search *inside* documents in a directory tree.
+
+Walks a folder, and for every supported file (.docx, .pdf, .xlsx/.xlsm/.xls,
+plus .txt/.csv/.md/.log/.tsv) it extracts the text and looks for your term,
+reporting exactly WHERE each hit is:
+    - PDF   -> page number
+    - Excel -> sheet name + cell (e.g. Sheet1!C7)
+    - Word  -> paragraph / table-cell index
+    - text  -> line number
+
+Usage:
+    python docsearch.py "invoice number"                 # search current dir
+    python docsearch.py "patient" --path ./records       # search a folder
+    python docsearch.py "INV-\\d+" --regex               # regex mode
+    python docsearch.py "Confidential" --case-sensitive
+    python docsearch.py "acme" --ext pdf,xlsx            # limit file types
+    python docsearch.py "acme" --files-only              # just list matching files
+
+Notes:
+    - Legacy .doc (old binary Word) is NOT readable by this script; convert to
+      .docx first (LibreOffice: `soffice --headless --convert-to docx *.doc`).
+    - Scanned/image PDFs have no embedded text; they'll come back empty unless
+      you OCR them first. The script flags files it couldn't extract text from.
+"""
+
+import argparse
+import os
+import re
+import sys
+
+# ---- optional deps: import lazily so a missing one only disables its type ----
+def _try(mod):
+    try:
+        return __import__(mod)
+    except Exception:
+        return None
+
+_docx = _try("docx")
+_pypdf = _try("pypdf")
+_openpyxl = _try("openpyxl")
+_xlrd = _try("xlrd")
+
+PLAINTEXT = {".txt", ".csv", ".md", ".log", ".tsv"}
+DEFAULT_EXTS = {".docx", ".pdf", ".xlsx", ".xlsm", ".xls"} | PLAINTEXT
+
+
+# --------------------------- text extractors ---------------------------------
+# Each yields (location_label, text) tuples. Any raised error is caught by the
+# caller and reported against the file rather than crashing the run.
+
+def extract_docx(path):
+    if not _docx:
+        raise RuntimeError("python-docx not installed")
+    from docx import Document
+    doc = Document(path)
+    for i, p in enumerate(doc.paragraphs, 1):
+        if p.text.strip():
+            yield (f"para {i}", p.text)
+    for ti, table in enumerate(doc.tables, 1):
+        for ri, row in enumerate(table.rows, 1):
+            for ci, cell in enumerate(row.cells, 1):
+                if cell.text.strip():
+                    yield (f"table {ti} r{ri}c{ci}", cell.text)
+
+
+def extract_pdf(path):
+    if not _pypdf:
+        raise RuntimeError("pypdf not installed")
+    from pypdf import PdfReader
+    reader = PdfReader(path)
+    any_text = False
+    for i, page in enumerate(reader.pages, 1):
+        txt = page.extract_text() or ""
+        if txt.strip():
+            any_text = True
+            yield (f"page {i}", txt)
+    if not any_text:
+        raise RuntimeError("no extractable text (scanned/image PDF? needs OCR)")
+
+
+def _col_letter(idx):  # 1-based -> A, B, ... AA
+    s = ""
+    while idx:
+        idx, r = divmod(idx - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def extract_xlsx(path):
+    if not _openpyxl:
+        raise RuntimeError("openpyxl not installed")
+    import openpyxl
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    for ws in wb.worksheets:
+        for r, row in enumerate(ws.iter_rows(values_only=True), 1):
+            for c, val in enumerate(row, 1):
+                if val is not None and str(val).strip():
+                    yield (f"{ws.title}!{_col_letter(c)}{r}", str(val))
+    wb.close()
+
+
+def extract_xls(path):
+    if not _xlrd:
+        raise RuntimeError("xlrd not installed (needed for legacy .xls)")
+    import xlrd
+    book = xlrd.open_workbook(path)
+    for sh in book.sheets():
+        for r in range(sh.nrows):
+            for c in range(sh.ncols):
+                val = sh.cell_value(r, c)
+                if val is not None and str(val).strip():
+                    yield (f"{sh.name}!{_col_letter(c + 1)}{r + 1}", str(val))
+
+
+def extract_text(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for i, line in enumerate(f, 1):
+            if line.strip():
+                yield (f"line {i}", line.rstrip("\n"))
+
+
+EXTRACTORS = {
+    ".docx": extract_docx,
+    ".pdf": extract_pdf,
+    ".xlsx": extract_xlsx,
+    ".xlsm": extract_xlsx,
+    ".xls": extract_xls,
+}
+for e in PLAINTEXT:
+    EXTRACTORS[e] = extract_text
+
+
+# ------------------------------ matching -------------------------------------
+def snippet(text, m, pad=40):
+    a = max(0, m.start() - pad)
+    b = min(len(text), m.end() + pad)
+    s = text[a:b].replace("\n", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return ("..." if a else "") + s + ("..." if b < len(text) else "")
+
+
+def search_file(path, pattern, per_unit_cap=5):
+    ext = os.path.splitext(path)[1].lower()
+    extractor = EXTRACTORS.get(ext)
+    if not extractor:
+        return None, None  # unsupported type
+    hits = []
+    for loc, text in extractor(path):
+        n = 0
+        for m in pattern.finditer(text):
+            hits.append((loc, snippet(text, m)))
+            n += 1
+            if n >= per_unit_cap:
+                break
+    return hits, None
+
+
+# -------------------------------- main ---------------------------------------
+def main():
+    ap = argparse.ArgumentParser(description="Search inside documents in a directory tree.")
+    ap.add_argument("query", help="text to find (or a regex with --regex)")
+    ap.add_argument("--path", default=".", help="directory to search (default: current)")
+    ap.add_argument("--regex", action="store_true", help="treat query as a regular expression")
+    ap.add_argument("--case-sensitive", action="store_true", help="default is case-insensitive")
+    ap.add_argument("--ext", help="comma list to restrict types, e.g. pdf,xlsx,docx")
+    ap.add_argument("--files-only", action="store_true", help="print only matching file paths")
+    ap.add_argument("--no-recurse", action="store_true", help="top-level directory only")
+    args = ap.parse_args()
+
+    flags = 0 if args.case_sensitive else re.IGNORECASE
+    try:
+        pattern = re.compile(args.query if args.regex else re.escape(args.query), flags)
+    except re.error as e:
+        sys.exit(f"bad regex: {e}")
+
+    exts = DEFAULT_EXTS
+    if args.ext:
+        want = {("." + x.strip().lstrip(".")).lower() for x in args.ext.split(",")}
+        exts = want
+
+    scanned = matched_files = total_hits = skipped = errored = 0
+
+    for root, dirs, files in os.walk(args.path):
+        for name in sorted(files):
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in exts:
+                continue
+            full = os.path.join(root, name)
+            scanned += 1
+            try:
+                hits, _ = search_file(full, pattern)
+            except Exception as e:
+                errored += 1
+                print(f"[!] {full}: {e}", file=sys.stderr)
+                continue
+            if hits is None:
+                skipped += 1
+                continue
+            if hits:
+                matched_files += 1
+                total_hits += len(hits)
+                if args.files_only:
+                    print(full)
+                else:
+                    print(f"\n{full}  ({len(hits)} match{'es' if len(hits) != 1 else ''})")
+                    for loc, snip in hits:
+                        print(f"    [{loc}] {snip}")
+        if args.no_recurse:
+            break
+
+    if not args.files_only:
+        print(f"\n--- {scanned} file(s) scanned | {matched_files} matched | "
+              f"{total_hits} hit(s) | {errored} error(s) ---")
+
+
+if __name__ == "__main__":
+    main()
