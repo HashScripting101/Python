@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""
+docsearch.py (hardened) - search inside documents across large directory trees.
+
+Scales to thousands of files / many GB via:
+  - a process pool (one worker per core) so CPU-bound PDF/Word extraction runs
+    in parallel instead of one-file-at-a-time;
+  - a per-file hit cap so a common term in a huge file can't balloon memory;
+  - streaming extractors for Excel (read_only) and text (line by line);
+  - directory pruning (.git, node_modules, ...) and a per-file size ceiling;
+  - a live progress line and per-file error isolation.
+
+Optional faster PDF backends (auto-detected, in order): PyMuPDF (`fitz`), then
+poppler's `pdftotext`, then pypdf. PyMuPDF is AGPL - fine for internal use, but
+check before shipping in a product. `pdftotext` is a separate binary, no linking
+concern.
+
+Usage:
+    python docsearch.py "invoice number" --path /data
+    python docsearch.py "INV-\\d+" --regex --workers 8
+    python docsearch.py "acme" --ext pdf,xlsx --max-per-file 10
+    python docsearch.py "acme" --files-only --path /mnt/share
+    python docsearch.py "acme" --max-size 500      # skip files larger than 500 MB
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor
+
+PLAINTEXT = {".txt", ".csv", ".md", ".log", ".tsv"}
+DEFAULT_EXTS = {".docx", ".pdf", ".xlsx", ".xlsm", ".xls"} | PLAINTEXT
+SKIP_DIRS = {".git", ".svn", "node_modules", "__pycache__", ".venv", "venv", ".idea"}
+
+_PATTERN = None
+_MAX_PER_FILE = 20
+_MAX_BYTES = None
+_PDF_BACKEND = None
+
+
+def _detect_pdf_backend():
+    try:
+        import fitz  # noqa: F401
+        return "pymupdf"
+    except Exception:
+        pass
+    if shutil.which("pdftotext"):
+        return "pdftotext"
+    try:
+        import pypdf  # noqa: F401
+        return "pypdf"
+    except Exception:
+        return None
+
+
+def _pdf_pages(path, backend):
+    if backend == "pymupdf":
+        import fitz
+        doc = fitz.open(path)
+        try:
+            for i in range(doc.page_count):
+                txt = doc.load_page(i).get_text("text") or ""
+                if txt.strip():
+                    yield (f"page {i + 1}", txt)
+        finally:
+            doc.close()
+        return
+    if backend == "pdftotext":
+        out = subprocess.run(["pdftotext", "-layout", path, "-"],
+                             capture_output=True, timeout=300)
+        text = out.stdout.decode("utf-8", "replace")
+        pages = text.split("\x0c")
+        got = False
+        for i, pg in enumerate(pages, 1):
+            if pg.strip():
+                got = True
+                yield (f"page {i}", pg)
+        if not got:
+            raise RuntimeError("no extractable text (scanned/image PDF? needs OCR)")
+        return
+    from pypdf import PdfReader
+    reader = PdfReader(path)
+    got = False
+    for i, page in enumerate(reader.pages, 1):
+        txt = page.extract_text() or ""
+        if txt.strip():
+            got = True
+            yield (f"page {i}", txt)
+    if not got:
+        raise RuntimeError("no extractable text (scanned/image PDF? needs OCR)")
+
+
+def _col_letter(idx):
+    s = ""
+    while idx:
+        idx, r = divmod(idx - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _docx_units(path):
+    from docx import Document
+    doc = Document(path)
+    for i, p in enumerate(doc.paragraphs, 1):
+        if p.text.strip():
+            yield (f"para {i}", p.text)
+    for ti, table in enumerate(doc.tables, 1):
+        for ri, row in enumerate(table.rows, 1):
+            for ci, cell in enumerate(row.cells, 1):
+                if cell.text.strip():
+                    yield (f"table {ti} r{ri}c{ci}", cell.text)
+
+
+def _xlsx_units(path):
+    import openpyxl
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        for ws in wb.worksheets:
+            for r, row in enumerate(ws.iter_rows(values_only=True), 1):
+                for c, val in enumerate(row, 1):
+                    if val is not None and str(val).strip():
+                        yield (f"{ws.title}!{_col_letter(c)}{r}", str(val))
+    finally:
+        wb.close()
+
+
+def _xls_units(path):
+    import xlrd
+    book = xlrd.open_workbook(path)
+    for sh in book.sheets():
+        for r in range(sh.nrows):
+            for c in range(sh.ncols):
+                val = sh.cell_value(r, c)
+                if val is not None and str(val).strip():
+                    yield (f"{sh.name}!{_col_letter(c + 1)}{r + 1}", str(val))
+
+
+def _text_units(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for i, line in enumerate(f, 1):
+            if line.strip():
+                yield (f"line {i}", line.rstrip("\n"))
+
+
+def _units_for(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".pdf":
+        return _pdf_pages(path, _PDF_BACKEND)
+    if ext == ".docx":
+        return _docx_units(path)
+    if ext in (".xlsx", ".xlsm"):
+        return _xlsx_units(path)
+    if ext == ".xls":
+        return _xls_units(path)
+    if ext in PLAINTEXT:
+        return _text_units(path)
+    return None
+
+
+def _snippet(text, m, pad=40):
+    a = max(0, m.start() - pad)
+    b = min(len(text), m.end() + pad)
+    s = re.sub(r"\s+", " ", text[a:b]).strip()
+    return ("..." if a else "") + s + ("..." if b < len(text) else "")
+
+
+def _pool_init(query, is_regex, flags, max_per_file, max_bytes):
+    global _PATTERN, _MAX_PER_FILE, _MAX_BYTES, _PDF_BACKEND
+    _PATTERN = re.compile(query if is_regex else re.escape(query), flags)
+    _MAX_PER_FILE = max_per_file
+    _MAX_BYTES = max_bytes
+    _PDF_BACKEND = _detect_pdf_backend()
+
+
+def scan_one(path):
+    try:
+        if _MAX_BYTES is not None:
+            try:
+                if os.path.getsize(path) > _MAX_BYTES:
+                    return (path, [], None, "too large")
+            except OSError:
+                pass
+        units = _units_for(path)
+        if units is None:
+            return (path, [], None, "unsupported")
+        hits = []
+        for loc, text in units:
+            for m in _PATTERN.finditer(text):
+                hits.append((loc, _snippet(text, m)))
+                if len(hits) >= _MAX_PER_FILE:
+                    return (path, hits, None, None)
+        return (path, hits, None, None)
+    except Exception as e:
+        return (path, [], f"{e.__class__.__name__}: {e}", None)
+
+
+def discover(root, exts, follow_symlinks):
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=follow_symlinks):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        for name in filenames:
+            if os.path.splitext(name)[1].lower() in exts:
+                yield os.path.join(dirpath, name)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Search inside documents across large trees.")
+    ap.add_argument("query")
+    ap.add_argument("--path", default=".")
+    ap.add_argument("--regex", action="store_true")
+    ap.add_argument("--case-sensitive", action="store_true")
+    ap.add_argument("--ext", help="comma list, e.g. pdf,xlsx,docx")
+    ap.add_argument("--files-only", action="store_true")
+    ap.add_argument("--workers", type=int, default=os.cpu_count())
+    ap.add_argument("--serial", action="store_true")
+    ap.add_argument("--max-per-file", type=int, default=20)
+    ap.add_argument("--max-size", type=float, default=None, help="skip files larger than N MB")
+    ap.add_argument("--follow-symlinks", action="store_true")
+    args = ap.parse_args()
+
+    flags = 0 if args.case_sensitive else re.IGNORECASE
+    if args.regex:
+        try:
+            re.compile(args.query, flags)
+        except re.error as e:
+            sys.exit(f"bad regex: {e}")
+
+    exts = DEFAULT_EXTS
+    if args.ext:
+        exts = {("." + x.strip().lstrip(".")).lower() for x in args.ext.split(",")}
+
+    max_bytes = int(args.max_size * 1024 * 1024) if args.max_size else None
+
+    print("Discovering files...", file=sys.stderr)
+    files = list(discover(args.path, exts, args.follow_symlinks))
+    total = len(files)
+    print(f"Found {total} candidate file(s). Scanning with "
+          f"{'1 (serial)' if args.serial else args.workers} worker(s).", file=sys.stderr)
+
+    scanned = matched = hits_total = errored = skipped = 0
+    t0 = time.time()
+
+    def handle(result):
+        nonlocal matched, hits_total, errored, skipped
+        path, hits, error, skip = result
+        if error:
+            errored += 1
+            print(f"[!] {path}: {error}", file=sys.stderr)
+            return
+        if skip:
+            skipped += 1
+            return
+        if hits:
+            matched += 1
+            hits_total += len(hits)
+            if args.files_only:
+                print(path)
+            else:
+                cap = " (capped)" if len(hits) >= args.max_per_file else ""
+                print(f"\n{path}  ({len(hits)} match{'es' if len(hits) != 1 else ''}{cap})")
+                for loc, snip in hits:
+                    print(f"    [{loc}] {snip}")
+
+    init_args = (args.query, args.regex, flags, args.max_per_file, max_bytes)
+
+    if args.serial:
+        _pool_init(*init_args)
+        for f in files:
+            handle(scan_one(f)); scanned += 1
+            if scanned % 200 == 0:
+                print(f"\r  {scanned}/{total} scanned, {matched} matched...", end="", file=sys.stderr)
+    else:
+        chunk = max(1, min(50, total // (args.workers * 4) or 1))
+        with ProcessPoolExecutor(max_workers=args.workers,
+                                 initializer=_pool_init, initargs=init_args) as ex:
+            for result in ex.map(scan_one, files, chunksize=chunk):
+                handle(result); scanned += 1
+                if scanned % 200 == 0:
+                    print(f"\r  {scanned}/{total} scanned, {matched} matched...", end="", file=sys.stderr)
+
+    dt = time.time() - t0
+    print(f"\r{' ' * 50}\r", end="", file=sys.stderr)
+    if not args.files_only:
+        rate = scanned / dt if dt else 0
+        print(f"\n--- {scanned} scanned | {matched} matched | {hits_total} hits | "
+              f"{skipped} skipped | {errored} errors | {dt:.1f}s ({rate:.0f} files/s) ---")
+
+
+if __name__ == "__main__":
+    main()
