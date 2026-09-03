@@ -1,0 +1,23 @@
+It walks the directory tree, and for each supported file it extracts the text and reports every hit with its location. 
+The extraction is per-format: PDFs give you the page number, Excel gives you Sheet!Cell (across all sheets), 
+Word gives you the paragraph or table-cell index, and plain text gives you the line number. One bad or unreadable 
+file gets reported to stderr and the run keeps going rather than crashing.
+
+python docsearch.py "invoice number"                # search current dir
+python docsearch.py "patient" --path ./records      # a specific folder
+python docsearch.py "INV-\d+" --regex               # regex mode
+python docsearch.py "Confidential" --case-sensitive
+python docsearch.py "acme" --ext pdf,xlsx           # limit file types
+python docsearch.py "acme" --files-only             # grep -l style
+
+Covered types: .docx, .pdf, .xlsx/.xlsm/.xls, plus .txt/.csv/.md/.log/.tsv as a freebie since they're trivial. 
+Adding .pptx (via python-docx's sibling python-pptx) is a five-line extractor if you want it.
+
+Two real limits worth knowing up front, both of which the script tells you about rather than failing silently. 
+Legacy .doc (the old binary Word format) can't be read by python-docx — convert to .docx first, e.g. soffice --headless --
+convert-to docx *.doc on your WSL side. And scanned/image PDFs have no embedded text layer, so they'll come back flagged as
+"no extractable text (needs OCR)" — you'd run something like ocrmypdf over them first, then re-search.
+
+The natural pairing with your earlier script is obvious: docsearch --files-only produces a list of files that contain a term, 
+which you could feed straight into a follow-up action. If you tell me the actual use case — which term, what you do with the matches — 
+I can tune the output format (CSV/JSON for piping, or a summary report) or add the OCR-fallback step so scanned PDFs get handled automatically instead of skipped.
